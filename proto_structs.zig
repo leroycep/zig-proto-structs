@@ -186,10 +186,12 @@ fn space_required(comptime T: type) u32 {
     }
 }
 
-pub fn Decoder(comptime T: type) type {
+pub fn Decoder(comptime _T: type) type {
     return struct {
         bytes: []const u8,
         ptr: u32,
+
+        const T = _T;
 
         pub fn fromBytes(bytes: []const u8) ?@This() {
             if (space_required(T) > bytes.len) {
@@ -331,6 +333,9 @@ pub fn Decoder(comptime T: type) type {
 
         pub fn toValue(this: @This()) T {
             switch (@typeInfo(T)) {
+                .Bool => {
+                    return this.bytes[this.ptr] != 0;
+                },
                 .Int => {
                     const size = @sizeOf(T);
                     return std.mem.readIntLittle(T, this.bytes[this.ptr..][0..size]);
@@ -365,7 +370,7 @@ pub fn Decoder(comptime T: type) type {
 
         pub fn tryToValue(this: @This()) !T {
             switch (@typeInfo(T)) {
-                .Int, .Optional, .Array => return this.toValue(),
+                .Bool, .Int, .Optional, .Array => return this.toValue(),
                 .Enum => |info| {
                     std.debug.assert(info.is_exhaustive);
                     const size = comptime space_required(T);
@@ -415,6 +420,143 @@ pub fn Decoder(comptime T: type) type {
             }
 
             return error.InvalidEnumValue;
+        }
+
+        pub fn access_type(comptime access_string: []const u8) type {
+            const State = enum {
+                uninit,
+                element_idx,
+                field_name,
+            };
+            var state = State.uninit;
+            var current_type = @This();
+            var field_name_start = 0;
+
+            for (access_string) |c, idx| {
+                switch (state) {
+                    .uninit => switch (c) {
+                        '[' => {
+                            const info = @typeInfo(current_type.T);
+                            const is_array = info == .Array;
+                            const is_slice = info == .Pointer and info.Pointer.size == .Slice;
+                            if (!(is_array or is_slice)) @compileError("Attempt to access non-array type " ++ @typeName(current_type.T) ++ " through indexing");
+                            state = .element_idx;
+                        },
+                        '.' => {
+                            const info = @typeInfo(current_type.T);
+                            const is_struct = info == .Struct;
+                            const is_enum = info == .Enum;
+                            const is_union = info == .Union;
+                            if (!(is_struct or is_enum or is_union)) @compileError("Attempt to access field in type " ++ @typeName(current_type.T));
+                            field_name_start = idx + 1;
+                            state = .field_name;
+                        },
+                        else => @compileError("Invalid character '" ++ [_]u8{c} ++ "'"),
+                    },
+                    .element_idx => switch (c) {
+                        '0'...'9' => {},
+                        ']' => {
+                            const current_child_type = current_type.child_type();
+                            current_type = Decoder(current_child_type);
+                            state = .uninit;
+                        },
+                        else => @compileError("Invalid character '" ++ [_]u8{c} ++ "'"),
+                    },
+                    .field_name => {
+                        const end_idx = switch (c) {
+                            'a'...'z', 'A'...'Z', '0'...'9', '_' => if (idx + 1 >= access_string.len) idx + 1 else continue,
+                            '[', '.' => idx,
+                            else => @compileError("Invalid character '" ++ [_]u8{c} ++ "'"),
+                        };
+
+                        const field_name = access_string[field_name_start..end_idx];
+                        comptime var child_field_type: ?type = null;
+                        inline for (std.meta.fields(current_type.T)) |child_field| {
+                            if (comptime std.mem.eql(u8, field_name, child_field.name)) {
+                                child_field_type = child_field.field_type;
+                                break;
+                            }
+                        }
+                        if (child_field_type == null) {
+                            @compileError("Unknown field '" ++ field_name ++ "' in type " ++ @typeName(current_type.T));
+                        }
+                        current_type = Decoder(child_field_type.?);
+
+                        if (idx + 1 >= access_string.len) return current_type;
+
+                        const info = @typeInfo(current_type.T);
+                        if (c == '.') {
+                            const is_struct = info == .Struct;
+                            const is_enum = info == .Enum;
+                            const is_union = info == .Union;
+                            if (!(is_struct or is_enum or is_union)) @compileError("Attempt to access field in type " ++ @typeName(current_type.T));
+                            field_name_start = idx + 1;
+                            state = .field_name;
+                        } else {
+                            const is_array = info == .Array;
+                            const is_slice = info == .Pointer and info.Pointer.size == .Slice;
+                            if (!(is_array or is_slice)) @compileError("Attempt to access non-array type " ++ @typeName(current_type.T) ++ " through indexing");
+                            state = .element_idx;
+                        }
+                    },
+                }
+            }
+
+            return current_type;
+        }
+
+        pub fn access(this: @This(), comptime access_string: []const u8) access_type(access_string) {
+            return this.tryAccess(access_string) catch unreachable;
+        }
+
+        pub fn tryAccess(this: @This(), comptime access_string: []const u8) !access_type(access_string) {
+            const State = enum {
+                uninit,
+                element_idx,
+                field_name,
+            };
+            comptime var state = State.uninit;
+            comptime var element_idx_start = 0;
+            comptime var field_name_start = 0;
+
+            if (access_string.len == 0) return this;
+
+            inline for (access_string) |c, idx| {
+                switch (state) {
+                    .uninit => switch (c) {
+                        '[' => {
+                            element_idx_start = idx + 1;
+                            state = .element_idx;
+                        },
+                        '.' => {
+                            field_name_start = idx + 1;
+                            state = .field_name;
+                        },
+                        else => @compileError("Invalid character '" ++ [_]u8{c} ++ "' at index "),
+                    },
+                    .element_idx => switch (c) {
+                        '0'...'9' => {},
+                        ']' => {
+                            const element_idx = try std.fmt.parseInt(u32, access_string[element_idx_start..idx], 10);
+                            const accessed_element = try this.tryElement(element_idx);
+                            return try accessed_element.tryAccess(access_string[idx + 1 ..]);
+                        },
+                        else => @compileError("Invalid character '" ++ [_]u8{c} ++ "'"),
+                    },
+                    .field_name => {
+                        const end_idx = switch (c) {
+                            'a'...'z', 'A'...'Z', '0'...'9', '_' => if (idx + 1 >= access_string.len) idx + 1 else continue,
+                            '[', '.' => idx,
+                            else => @compileError("Invalid character '" ++ [_]u8{c} ++ "'"),
+                        };
+
+                        const accessed_field = try this.tryField(access_string[field_name_start..end_idx]);
+                        return try accessed_field.tryAccess(access_string[end_idx..]);
+                    },
+                }
+            }
+
+            return current_type;
         }
     };
 }
@@ -662,4 +804,79 @@ test "write and read graphs" {
             current = next;
         }
     }
+}
+
+test "access function for accessing deeply nested data" {
+    const FlightSegmentInfo = struct {
+        flightNumber: []const u8,
+        departureAirport: []const u8,
+        arrivalAirport: []const u8,
+    };
+    const SeatInfo = struct {
+        seatNumber: []const u8,
+        available: bool,
+    };
+    const CabinType = enum(u8) {
+        First,
+        Economy,
+    };
+    const RowInfo = struct {
+        cabinType: CabinType,
+        seats: []const SeatInfo,
+    };
+    const SeatMapReponse = struct {
+        flightSegmentInfo: FlightSegmentInfo,
+        seatMap: []const RowInfo,
+    };
+    const AirSeatMap = struct {
+        responses: []const SeatMapReponse,
+    };
+
+    const air_seat_map = AirSeatMap{
+        .responses = &[_]SeatMapReponse{.{
+            .flightSegmentInfo = .{
+                .flightNumber = "1179",
+                .departureAirport = "LAS",
+                .arrivalAirport = "IAH",
+            },
+            .seatMap = &[_]RowInfo{
+                .{
+                    .cabinType = .First,
+                    .seats = &.{
+                        .{ .seatNumber = "1A", .available = false },
+                        .{ .seatNumber = "1B", .available = false },
+                        .{ .seatNumber = "1E", .available = false },
+                        .{ .seatNumber = "1F", .available = false },
+                    },
+                },
+                .{
+                    .cabinType = .Economy,
+                    .seats = &.{
+                        .{ .seatNumber = "7A", .available = false },
+                        .{ .seatNumber = "7B", .available = false },
+                        .{ .seatNumber = "7C", .available = true },
+                        .{ .seatNumber = "7D", .available = false },
+                        .{ .seatNumber = "7E", .available = false },
+                        .{ .seatNumber = "7F", .available = false },
+                    },
+                },
+            },
+        }},
+    };
+
+    @setEvalBranchQuota(10000);
+    const decoder = testWriteThenDecode(std.testing.allocator, air_seat_map);
+    defer std.testing.allocator.free(decoder.bytes);
+
+    std.testing.expectEqualSlices(u8, "1179", decoder.access(".responses[0].flightSegmentInfo.flightNumber").asSlice());
+    std.testing.expectEqualSlices(u8, "LAS", decoder.access(".responses[0].flightSegmentInfo.departureAirport").asSlice());
+    std.testing.expectEqualSlices(u8, "IAH", decoder.access(".responses[0].flightSegmentInfo.arrivalAirport").asSlice());
+
+    std.testing.expectEqual(CabinType.First, try decoder.access(".responses[0].seatMap[0].cabinType").tryToValue());
+    std.testing.expectEqualSlices(u8, "1A", decoder.access(".responses[0].seatMap[0].seats[0].seatNumber").asSlice());
+    std.testing.expectEqual(false, try decoder.access(".responses[0].seatMap[0].seats[0].available").tryToValue());
+
+    std.testing.expectEqual(CabinType.Economy, try decoder.access(".responses[0].seatMap[1].cabinType").tryToValue());
+    std.testing.expectEqualSlices(u8, "7C", decoder.access(".responses[0].seatMap[1].seats[2].seatNumber").asSlice());
+    std.testing.expectEqual(true, try decoder.access(".responses[0].seatMap[1].seats[2].available").tryToValue());
 }
