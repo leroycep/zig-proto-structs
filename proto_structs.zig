@@ -3,15 +3,19 @@ const std = @import("std");
 pub const Encoder = struct {
     allocator: *std.mem.Allocator = undefined,
     bytes: std.ArrayList(u8) = undefined,
+    pointers_encoded: std.AutoHashMap(usize, u32) = undefined,
 
     pub const Error = error{} || std.mem.Allocator.Error;
 
     pub fn encode(this: *@This(), allocator: *std.mem.Allocator, value: anytype) ![]u8 {
         this.allocator = allocator;
         this.bytes = std.ArrayList(u8).init(allocator);
+        this.pointers_encoded = std.AutoHashMap(usize, u32).init(allocator);
         defer {
             this.allocator = undefined;
             this.bytes = undefined;
+            this.pointers_encoded.deinit();
+            this.pointers_encoded = undefined;
         }
 
         const root_byte_len = space_required(@TypeOf(value));
@@ -39,13 +43,28 @@ pub const Encoder = struct {
 
     fn encode_value(this: *@This(), value: anytype, space: Space) Error!void {
         const T = @TypeOf(value);
+        //std.log.warn("encode_value({}) space = {}", .{ T, space });
         switch (@typeInfo(T)) {
             .Int => |info| {
                 var slice = this.space_to_slice(space);
                 std.mem.writeIntLittle(T, slice[0..@sizeOf(T)], value);
             },
             .Pointer => |info| switch (info.size) {
-                .One => {},
+                .One => {
+                    const gop = try this.pointers_encoded.getOrPut(@ptrToInt(value));
+
+                    const child_size = space_required(info.child);
+                    //std.log.warn("encode_value({}) child_size = {}", .{ T, child_size });
+                    if (!gop.found_existing) {
+                        const child_space = try this.reserve_space(child_size);
+
+                        gop.entry.value = child_space.ptr;
+
+                        try this.encode_value(value.*, child_space);
+                    }
+                    var slice = this.space_to_slice(space);
+                    std.mem.writeIntLittle(u32, slice[0..4], gop.entry.value);
+                },
                 .Slice => {
                     const child_size = space_required(info.child);
                     const len = @intCast(u32, value.len);
@@ -56,6 +75,7 @@ pub const Encoder = struct {
                         std.mem.writeIntLittle(u32, slice[0..4], children_space.ptr);
                         std.mem.writeIntLittle(u32, slice[4..8], len);
                     }
+                    //std.log.warn("encode_value({}) children_space = {}, space_bytes = {}", .{ T, children_space, fmtSliceHexSpaced(this.bytes.items) });
                     // Write child values
                     {
                         for (value) |child, idx| {
@@ -67,15 +87,15 @@ pub const Encoder = struct {
                 else => |s| @compileError("Pointer size " ++ s ++ " is not supported"),
             },
             .Struct => |info| {
-                comptime var ptr: u32 = 0;
+                comptime var offset: u32 = 0;
                 inline for (info.fields) |field| {
                     const field_len = comptime space_required(field.field_type);
                     const field_space = Space{
-                        .ptr = ptr,
+                        .ptr = space.ptr + offset,
                         .len = field_len,
                     };
                     try this.encode_value(@field(value, field.name), field_space);
-                    ptr += field_len;
+                    offset += field_len;
                 }
             },
             .Optional => |info| {
@@ -189,10 +209,10 @@ pub fn Decoder(comptime T: type) type {
             switch (@typeInfo(T)) {
                 .Pointer => |info| {
                     if (info.size != .Slice) {
-                        @compileError("Cannot access pointer size " ++ s ++ " as an array. Only slices are supported.");
+                        @compileError("Cannot access pointer size " ++ std.meta.tagName(info.size) ++ " as an array. Only slices are supported.");
                     }
-                    const len = std.mem.readIntLittle(u32, this.bytes[this.ptr..][4..8]);
-                    if (idx > len) {
+                    const length = std.mem.readIntLittle(u32, this.bytes[this.ptr..][4..8]);
+                    if (idx > length) {
                         // TODO: Consider returning an error instead?
                         return null;
                     }
@@ -209,18 +229,48 @@ pub fn Decoder(comptime T: type) type {
             }
         }
 
+        pub fn len(this: @This()) u32 {
+            switch (@typeInfo(T)) {
+                .Pointer => |info| {
+                    if (info.size != .Slice) {
+                        @compileError("Cannot access pointer size " ++ std.meta.tagName(info.size) ++ " as an array. Only slices are supported.");
+                    }
+                    return std.mem.readIntLittle(u32, this.bytes[this.ptr..][4..8]);
+                },
+                else => |t| @compileError("Cannot access type " ++ std.meta.tagName(t) ++ " as an array"),
+            }
+        }
+
+        pub fn deref(this: @This()) ?Decoder(child_type()) {
+            switch (@typeInfo(T)) {
+                .Pointer => |info| {
+                    if (info.size != .One) {
+                        @compileError("Cannot access pointer size " ++ std.meta.tagName(info.size) ++ " as a pointer.");
+                    }
+                    const ptr = std.mem.readIntLittle(u32, this.bytes[this.ptr..][0..4]);
+                    const child_size = space_required(child_type());
+                    if (ptr > this.bytes.len) {
+                        // TODO: Consider returning an error instead?
+                        return null;
+                    }
+                    return Decoder(child_type()){ .bytes = this.bytes, .ptr = ptr };
+                },
+                else => |t| @compileError("Cannot access type " ++ std.meta.tagName(t) ++ " as an array"),
+            }
+        }
+
         pub fn asSlice(this: @This()) ?[]const child_type() {
             const ti = @typeInfo(T);
             if (ti != .Pointer or ti.Pointer.size != .Slice or ti.Pointer.child != u8) {
                 @compileError("Cannot get " ++ @typeName(T) ++ " as a slice.");
             }
             const ptr = std.mem.readIntLittle(u32, this.bytes[this.ptr..][0..4]);
-            const len = std.mem.readIntLittle(u32, this.bytes[this.ptr..][4..8]);
-            if (ptr > this.bytes.len or ptr + len > this.bytes.len) {
+            const length = std.mem.readIntLittle(u32, this.bytes[this.ptr..][4..8]);
+            if (ptr > this.bytes.len or ptr + length > this.bytes.len) {
                 // TODO: Consider returning an error instead?
                 return null;
             }
-            return this.bytes[ptr .. ptr + len];
+            return this.bytes[ptr .. ptr + length];
         }
 
         fn field_type(comptime field_name: []const u8) type {
@@ -240,16 +290,16 @@ pub fn Decoder(comptime T: type) type {
         pub fn field(this: @This(), comptime field_name: []const u8) ?Decoder(field_type(field_name)) {
             switch (@typeInfo(T)) {
                 .Struct => |info| {
-                    comptime var ptr: u32 = 0;
+                    comptime var offset: u32 = 0;
                     inline for (info.fields) |child_field| {
                         if (comptime std.mem.eql(u8, field_name, child_field.name)) {
                             return Decoder(child_field.field_type){
                                 .bytes = this.bytes,
-                                .ptr = this.ptr + ptr,
+                                .ptr = this.ptr + offset,
                             };
                         }
                         const field_len = comptime space_required(child_field.field_type);
-                        ptr += field_len;
+                        offset += field_len;
                     }
                     @compileError("Unknown field " ++ field_name ++ " in struct " ++ @typeName(T));
                 },
@@ -531,6 +581,84 @@ test "write and read union" {
                 std.testing.expectEqualSlices(u8, "hello", text_decoder.asSlice().?);
             },
             else => unreachable,
+        }
+    }
+}
+
+const N = struct {
+    edges: []const *const @This(),
+};
+
+fn formatSliceHexSpaced(
+    bytes: []const u8,
+    comptime fmt: []const u8,
+    options: std.fmt.FormatOptions,
+    writer: anytype,
+) !void {
+    const charset = "0123456789abcdef";
+    var buf: [3]u8 = undefined;
+    buf[2] = ' ';
+
+    for (bytes) |c| {
+        buf[0] = charset[c >> 4];
+        buf[1] = charset[c & 15];
+        try writer.writeAll(&buf);
+    }
+}
+
+fn fmtSliceHexSpaced(bytes: []const u8) std.fmt.Formatter(formatSliceHexSpaced) {
+    return .{ .data = bytes };
+}
+
+test "write and read graphs" {
+    {
+        // Empty graph
+        const graph = N{ .edges = &.{} };
+        const decoder = testWriteThenDecode(std.testing.allocator, graph);
+        defer std.testing.allocator.free(decoder.bytes);
+        std.testing.expectEqual(@as(u32, 0), decoder.field("edges").?.len());
+    }
+    {
+        // Tree
+        const n0 = N{ .edges = &.{} };
+        const n1 = N{ .edges = &.{} };
+        const n2 = N{ .edges = &.{ &n0, &n1 } };
+        const n3 = N{ .edges = &.{} };
+        const graph = N{ .edges = &.{ &n2, &n3 } };
+
+        const decoder = testWriteThenDecode(std.testing.allocator, graph);
+        defer std.testing.allocator.free(decoder.bytes);
+
+        const root_edges = decoder.field("edges").?;
+        std.testing.expectEqual(@as(u32, 2), root_edges.len());
+
+        std.testing.expectEqual(@as(u32, 2), root_edges.element(0).?.deref().?.field("edges").?.len());
+        std.testing.expectEqual(@as(u32, 0), root_edges.element(1).?.deref().?.field("edges").?.len());
+
+        const elem0_edges = root_edges.element(0).?.deref().?.field("edges").?;
+        std.testing.expectEqual(@as(u32, 0), elem0_edges.element(0).?.deref().?.field("edges").?.len());
+        std.testing.expectEqual(@as(u32, 0), elem0_edges.element(1).?.deref().?.field("edges").?.len());
+    }
+    {
+        const LN = struct { next: *const @This() };
+
+        // cyclical graph
+        var graph: LN = undefined;
+        const n0 = LN{ .next = &graph };
+        const n1 = LN{ .next = &n0 };
+        graph = LN{ .next = &n1 };
+
+        const decoder = testWriteThenDecode(std.testing.allocator, @as(*const LN, &graph));
+        defer std.testing.allocator.free(decoder.bytes);
+
+        const decoder_val = decoder.deref().?;
+        var current: Decoder(LN) = decoder_val.field("next").?.deref().?;
+        var iterations: u32 = 0;
+        while (!std.meta.eql(decoder_val, current)) : (iterations += 1) {
+            if (iterations > 100) std.debug.assert(false);
+
+            const next = current.field("next").?.deref().?;
+            current = next;
         }
     }
 }
