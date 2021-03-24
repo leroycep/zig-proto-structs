@@ -45,6 +45,10 @@ pub const Encoder = struct {
         const T = @TypeOf(value);
         //std.log.warn("encode_value({}) space = {}", .{ T, space });
         switch (@typeInfo(T)) {
+            .Bool => {
+                var slice = this.space_to_slice(space);
+                slice[0] = @boolToInt(value);
+            },
             .Int => |info| {
                 var slice = this.space_to_slice(space);
                 std.mem.writeIntLittle(T, slice[0..@sizeOf(T)], value);
@@ -135,6 +139,7 @@ pub const Encoder = struct {
 
 fn space_required(comptime T: type) u32 {
     switch (@typeInfo(T)) {
+        .Bool => return 1,
         .Int => |info| {
             if (info.bits % 8 != 0) {
                 @compileError("Cannot use int " ++ @typeName(T) ++ "; integer bits must be a multiple of 8");
