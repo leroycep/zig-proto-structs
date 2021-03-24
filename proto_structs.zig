@@ -205,7 +205,11 @@ pub fn Decoder(comptime T: type) type {
             }
         }
 
-        pub fn element(this: @This(), idx: u32) ?Decoder(child_type()) {
+        pub fn element(this: @This(), idx: u32) Decoder(child_type()) {
+            return this.tryElement(idx) catch unreachable;
+        }
+
+        pub fn tryElement(this: @This(), idx: u32) !Decoder(child_type()) {
             switch (@typeInfo(T)) {
                 .Pointer => |info| {
                     if (info.size != .Slice) {
@@ -213,15 +217,13 @@ pub fn Decoder(comptime T: type) type {
                     }
                     const length = std.mem.readIntLittle(u32, this.bytes[this.ptr..][4..8]);
                     if (idx > length) {
-                        // TODO: Consider returning an error instead?
-                        return null;
+                        return error.OutOfBounds;
                     }
                     const ptr = std.mem.readIntLittle(u32, this.bytes[this.ptr..][0..4]);
                     const child_size = space_required(child_type());
                     const child_ptr = ptr + idx * child_size;
-                    if (child_ptr > this.bytes.len) {
-                        // TODO: Consider returning an error instead?
-                        return null;
+                    if (child_ptr + child_size > this.bytes.len) {
+                        return error.OutOfBounds;
                     }
                     return Decoder(child_type()){ .bytes = this.bytes, .ptr = child_ptr };
                 },
@@ -241,7 +243,11 @@ pub fn Decoder(comptime T: type) type {
             }
         }
 
-        pub fn deref(this: @This()) ?Decoder(child_type()) {
+        pub fn deref(this: @This()) Decoder(child_type()) {
+            return this.tryDeref() catch unreachable;
+        }
+
+        pub fn tryDeref(this: @This()) !Decoder(child_type()) {
             switch (@typeInfo(T)) {
                 .Pointer => |info| {
                     if (info.size != .One) {
@@ -249,9 +255,9 @@ pub fn Decoder(comptime T: type) type {
                     }
                     const ptr = std.mem.readIntLittle(u32, this.bytes[this.ptr..][0..4]);
                     const child_size = space_required(child_type());
-                    if (ptr > this.bytes.len) {
+                    if (ptr + child_size > this.bytes.len) {
                         // TODO: Consider returning an error instead?
-                        return null;
+                        return error.OutOfBounds;
                     }
                     return Decoder(child_type()){ .bytes = this.bytes, .ptr = ptr };
                 },
@@ -259,16 +265,20 @@ pub fn Decoder(comptime T: type) type {
             }
         }
 
-        pub fn asSlice(this: @This()) ?[]const child_type() {
+        pub fn asSlice(this: @This()) []const child_type() {
+            return this.tryAsSlice() catch unreachable;
+        }
+
+        pub fn tryAsSlice(this: @This()) ![]const child_type() {
             const ti = @typeInfo(T);
             if (ti != .Pointer or ti.Pointer.size != .Slice or ti.Pointer.child != u8) {
                 @compileError("Cannot get " ++ @typeName(T) ++ " as a slice.");
             }
             const ptr = std.mem.readIntLittle(u32, this.bytes[this.ptr..][0..4]);
             const length = std.mem.readIntLittle(u32, this.bytes[this.ptr..][4..8]);
-            if (ptr > this.bytes.len or ptr + length > this.bytes.len) {
-                // TODO: Consider returning an error instead?
-                return null;
+            const child_size = space_required(child_type());
+            if (ptr > this.bytes.len or ptr + length * child_size > this.bytes.len) {
+                return error.OutOfBounds;
             }
             return this.bytes[ptr .. ptr + length];
         }
@@ -287,18 +297,25 @@ pub fn Decoder(comptime T: type) type {
             }
         }
 
-        pub fn field(this: @This(), comptime field_name: []const u8) ?Decoder(field_type(field_name)) {
+        pub fn field(this: @This(), comptime field_name: []const u8) Decoder(field_type(field_name)) {
+            return this.tryField(field_name) catch unreachable;
+        }
+
+        pub fn tryField(this: @This(), comptime field_name: []const u8) !Decoder(field_type(field_name)) {
             switch (@typeInfo(T)) {
                 .Struct => |info| {
                     comptime var offset: u32 = 0;
                     inline for (info.fields) |child_field| {
+                        const field_len = comptime space_required(child_field.field_type);
                         if (comptime std.mem.eql(u8, field_name, child_field.name)) {
+                            if (this.ptr + offset + field_len > this.bytes.len) {
+                                return error.OutOfBounds;
+                            }
                             return Decoder(child_field.field_type){
                                 .bytes = this.bytes,
                                 .ptr = this.ptr + offset,
                             };
                         }
-                        const field_len = comptime space_required(child_field.field_type);
                         offset += field_len;
                     }
                     @compileError("Unknown field " ++ field_name ++ " in struct " ++ @typeName(T));
@@ -444,8 +461,8 @@ test "read data from proto encoding" {
 
     const decoder = Decoder([]const []const u8).fromBytes(&bytes).?;
 
-    std.testing.expectEqualSlices(u8, "hello", decoder.element(0).?.asSlice().?);
-    std.testing.expectEqualSlices(u8, "world", decoder.element(1).?.asSlice().?);
+    std.testing.expectEqualSlices(u8, "hello", decoder.element(0).asSlice());
+    std.testing.expectEqualSlices(u8, "world", decoder.element(1).asSlice());
 }
 
 test "write and read struct data from proto encoding" {
@@ -494,10 +511,10 @@ test "write and read struct data from proto encoding" {
     // Test decoding struct
     const decoder = Decoder(S).fromBytes(encoded_bytes).?;
 
-    std.testing.expectEqual(@as(u64, 1337), decoder.field("start").?.toValue());
-    std.testing.expectEqualSlices(u8, input_data.tags[0], decoder.field("tags").?.element(0).?.asSlice().?);
-    std.testing.expectEqualSlices(u8, input_data.tags[1], decoder.field("tags").?.element(1).?.asSlice().?);
-    std.testing.expectEqualSlices(u8, input_data.tags[2], decoder.field("tags").?.element(2).?.asSlice().?);
+    std.testing.expectEqual(@as(u64, 1337), decoder.field("start").toValue());
+    std.testing.expectEqualSlices(u8, input_data.tags[0], decoder.field("tags").element(0).asSlice());
+    std.testing.expectEqualSlices(u8, input_data.tags[1], decoder.field("tags").element(1).asSlice());
+    std.testing.expectEqualSlices(u8, input_data.tags[2], decoder.field("tags").element(2).asSlice());
 }
 
 fn testWriteThenDecode(allocator: *std.mem.Allocator, value: anytype) Decoder(@TypeOf(value)) {
@@ -578,45 +595,24 @@ test "write and read union" {
         defer std.testing.allocator.free(decoder.bytes);
         switch (try decoder.toUnion()) {
             .text => |text_decoder| {
-                std.testing.expectEqualSlices(u8, "hello", text_decoder.asSlice().?);
+                std.testing.expectEqualSlices(u8, "hello", text_decoder.asSlice());
             },
             else => unreachable,
         }
     }
 }
 
-const N = struct {
-    edges: []const *const @This(),
-};
-
-fn formatSliceHexSpaced(
-    bytes: []const u8,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) !void {
-    const charset = "0123456789abcdef";
-    var buf: [3]u8 = undefined;
-    buf[2] = ' ';
-
-    for (bytes) |c| {
-        buf[0] = charset[c >> 4];
-        buf[1] = charset[c & 15];
-        try writer.writeAll(&buf);
-    }
-}
-
-fn fmtSliceHexSpaced(bytes: []const u8) std.fmt.Formatter(formatSliceHexSpaced) {
-    return .{ .data = bytes };
-}
-
 test "write and read graphs" {
+    const N = struct {
+        edges: []const *const @This(),
+    };
+
     {
         // Empty graph
         const graph = N{ .edges = &.{} };
         const decoder = testWriteThenDecode(std.testing.allocator, graph);
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(@as(u32, 0), decoder.field("edges").?.len());
+        std.testing.expectEqual(@as(u32, 0), decoder.field("edges").len());
     }
     {
         // Tree
@@ -629,15 +625,15 @@ test "write and read graphs" {
         const decoder = testWriteThenDecode(std.testing.allocator, graph);
         defer std.testing.allocator.free(decoder.bytes);
 
-        const root_edges = decoder.field("edges").?;
+        const root_edges = decoder.field("edges");
         std.testing.expectEqual(@as(u32, 2), root_edges.len());
 
-        std.testing.expectEqual(@as(u32, 2), root_edges.element(0).?.deref().?.field("edges").?.len());
-        std.testing.expectEqual(@as(u32, 0), root_edges.element(1).?.deref().?.field("edges").?.len());
+        std.testing.expectEqual(@as(u32, 2), root_edges.element(0).deref().field("edges").len());
+        std.testing.expectEqual(@as(u32, 0), root_edges.element(1).deref().field("edges").len());
 
-        const elem0_edges = root_edges.element(0).?.deref().?.field("edges").?;
-        std.testing.expectEqual(@as(u32, 0), elem0_edges.element(0).?.deref().?.field("edges").?.len());
-        std.testing.expectEqual(@as(u32, 0), elem0_edges.element(1).?.deref().?.field("edges").?.len());
+        const elem0_edges = root_edges.element(0).deref().field("edges");
+        std.testing.expectEqual(@as(u32, 0), elem0_edges.element(0).deref().field("edges").len());
+        std.testing.expectEqual(@as(u32, 0), elem0_edges.element(1).deref().field("edges").len());
     }
     {
         const LN = struct { next: *const @This() };
@@ -651,13 +647,13 @@ test "write and read graphs" {
         const decoder = testWriteThenDecode(std.testing.allocator, @as(*const LN, &graph));
         defer std.testing.allocator.free(decoder.bytes);
 
-        const decoder_val = decoder.deref().?;
-        var current: Decoder(LN) = decoder_val.field("next").?.deref().?;
+        const decoder_val = decoder.deref();
+        var current: Decoder(LN) = decoder_val.field("next").deref();
         var iterations: u32 = 0;
         while (!std.meta.eql(decoder_val, current)) : (iterations += 1) {
             if (iterations > 100) std.debug.assert(false);
 
-            const next = current.field("next").?.deref().?;
+            const next = current.field("next").deref();
             current = next;
         }
     }
