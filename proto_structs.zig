@@ -149,6 +149,7 @@ pub const Encoder = struct {
                     }
                 }
             },
+            .Void => {},
             else => |t| @compileError("Type " ++ std.meta.tagName(t) ++ " is not supported"),
         }
     }
@@ -199,6 +200,7 @@ fn space_required(comptime T: type) u32 {
             }
             return size + comptime space_required(info.tag_type.?);
         },
+        .Void => return 0,
         else => |t| @compileError("Type " ++ std.meta.tagName(t) ++ " is not supported"),
     }
 }
@@ -218,6 +220,121 @@ pub fn Decoder(comptime _T: type) type {
                 .bytes = bytes,
                 .ptr = 0,
             };
+        }
+
+        /// Recursively decodes the struct, allocating any space needed for slices. This space must
+        /// be freed by the caller. Using an ArenaAllocator is recommended.
+        pub fn decode(this: @This(), allocator: *std.mem.Allocator) !T {
+            switch (@typeInfo(T)) {
+                .Void => return {},
+                .Bool => {
+                    return this.bytes[this.ptr] != 0;
+                },
+                .Int => {
+                    const size = @sizeOf(T);
+                    return std.mem.readIntLittle(T, this.bytes[this.ptr..][0..size]);
+                },
+                .Optional => |info| {
+                    if (this.bytes[this.ptr] == 1) {
+                        return try (Decoder(info.child){
+                            .bytes = this.bytes,
+                            .ptr = this.ptr + 1,
+                        }).decode(allocator);
+                    } else {
+                        return null;
+                    }
+                },
+                .Array => |info| {
+                    var val: [info.len]info.child = undefined;
+
+                    const size = space_required(info.child);
+                    var i: u32 = 0;
+                    while (i < info.len) : (i += 1) {
+                        val[i] = try (Decoder(info.child){
+                            .bytes = this.bytes,
+                            .ptr = this.ptr + i * size,
+                        }).decode(allocator);
+                    }
+
+                    return val;
+                },
+                .Struct => |info| {
+                    var struct_value: T = undefined;
+                    comptime var offset: u32 = 0;
+                    inline for (info.fields) |child_field| {
+                        @field(struct_value, child_field.name) = try (Decoder(child_field.field_type){
+                            .bytes = this.bytes,
+                            .ptr = this.ptr + offset,
+                        }).decode(allocator);
+
+                        offset += comptime space_required(child_field.field_type);
+                    }
+                    return struct_value;
+                },
+                .Enum => |info| {
+                    std.debug.assert(info.is_exhaustive);
+                    const size = comptime space_required(T);
+                    const tag_int = std.mem.readIntLittle(info.tag_type, this.bytes[this.ptr..][0..size]);
+                    return try std.meta.intToEnum(T, tag_int);
+                },
+                .Union => |info| {
+                    const TagType = info.tag_type.?;
+                    const size = space_required(TagType);
+                    const child_ptr = this.ptr + size;
+
+                    const tag = try (Decoder(TagType){ .bytes = this.bytes, .ptr = this.ptr }).tryToValue();
+
+                    inline for (@typeInfo(T).Union.fields) |union_field, idx| {
+                        if (tag == comptime std.meta.stringToEnum(TagType, union_field.name).?) {
+                            return @unionInit(decoder_union(T), union_field.name, try (Decoder(union_field.field_type){
+                                .bytes = this.bytes,
+                                .ptr = child_ptr,
+                            }).decode(allocator));
+                        }
+                    }
+
+                    return error.InvalidEnumValue;
+                },
+                .Pointer => |info| switch (info.size) {
+                    // TODO: If a pointer has be deserialized, don't duplicate it
+                    .One => {
+                        const ptr = std.mem.readIntLittle(u32, this.bytes[this.ptr..][0..4]);
+                        const child_size = space_required(child_type());
+                        if (ptr + child_size > this.bytes.len) {
+                            // TODO: Consider returning an error instead?
+                            return error.OutOfBounds;
+                        }
+
+                        const native_ptr = try allocator.create(child_type());
+                        errdefer allocator.destroy(native_ptr);
+
+                        native_ptr.* = try (Decoder(child_type()){ .bytes = this.bytes, .ptr = ptr }).decode(allocator);
+                        return native_ptr;
+                    },
+                    .Slice => {
+                        const length = std.mem.readIntLittle(u32, this.bytes[this.ptr..][4..8]);
+                        const ptr = std.mem.readIntLittle(u32, this.bytes[this.ptr..][0..4]);
+                        const child_size = space_required(child_type());
+                        if (ptr + length * child_size > this.bytes.len) {
+                            return error.OutOfBounds;
+                        }
+
+                        // Decode child values
+                        const slice_value = try allocator.alloc(child_type(), length);
+                        errdefer allocator.free(slice_value);
+
+                        for (slice_value) |*child, idx| {
+                            const child_ptr = ptr + @intCast(u32, idx) * child_size;
+                            const decoder = Decoder(child_type()){ .bytes = this.bytes, .ptr = child_ptr };
+                            child.* = try decoder.decode(allocator);
+                        }
+
+                        return slice_value;
+                    },
+                    else => |s| @compileError("Pointer size " ++ s ++ " is not supported"),
+                },
+                else => |ti| @compileError("Cannot decode a " ++ std.meta.tagName(ti) ++ " value"),
+            }
         }
 
         fn child_type() type {
@@ -446,7 +563,6 @@ pub fn Decoder(comptime _T: type) type {
             const size = space_required(TagType);
             const child_ptr = this.ptr + size;
 
-            //const tag_value = std.mem.readIntLittle(TagValueType, this.bytes[this.ptr..][0..size]);
             const tag = try (Decoder(TagType){ .bytes = this.bytes, .ptr = this.ptr }).tryToValue();
 
             inline for (@typeInfo(T).Union.fields) |union_field, idx| {
@@ -918,4 +1034,88 @@ test "access function for accessing deeply nested data" {
     std.testing.expectEqual(CabinType.Economy, try decoder.access(".responses[0].seatMap[1].cabinType").tryToValue());
     std.testing.expectEqualSlices(u8, "7C", decoder.access(".responses[0].seatMap[1].seats[2].seatNumber").asSlice());
     std.testing.expectEqual(true, try decoder.access(".responses[0].seatMap[1].seats[2].available").tryToValue());
+}
+
+test "decode deeply nested data" {
+    const FlightSegmentInfo = struct {
+        flightNumber: []const u8,
+        departureAirport: []const u8,
+        arrivalAirport: []const u8,
+    };
+    const SeatInfo = struct {
+        seatNumber: []const u8,
+        available: bool,
+    };
+    const CabinType = enum(u8) {
+        First,
+        Economy,
+    };
+    const CabinTypeUnion = union(CabinType) {
+        First: void,
+        Economy: u32,
+    };
+    const RowInfo = struct {
+        cabinType: CabinTypeUnion,
+        seats: []const SeatInfo,
+    };
+    const SeatMapReponse = struct {
+        flightSegmentInfo: FlightSegmentInfo,
+        seatMap: []const RowInfo,
+    };
+    const AirSeatMap = struct {
+        responses: []const SeatMapReponse,
+    };
+
+    const air_seat_map = AirSeatMap{
+        .responses = &[_]SeatMapReponse{.{
+            .flightSegmentInfo = .{
+                .flightNumber = "1179",
+                .departureAirport = "LAS",
+                .arrivalAirport = "IAH",
+            },
+            .seatMap = &[_]RowInfo{
+                .{
+                    .cabinType = .First,
+                    .seats = &.{
+                        .{ .seatNumber = "1A", .available = false },
+                        .{ .seatNumber = "1B", .available = false },
+                        .{ .seatNumber = "1E", .available = false },
+                        .{ .seatNumber = "1F", .available = false },
+                    },
+                },
+                .{
+                    .cabinType = .{ .Economy = 10 },
+                    .seats = &.{
+                        .{ .seatNumber = "7A", .available = false },
+                        .{ .seatNumber = "7B", .available = false },
+                        .{ .seatNumber = "7C", .available = true },
+                        .{ .seatNumber = "7D", .available = false },
+                        .{ .seatNumber = "7E", .available = false },
+                        .{ .seatNumber = "7F", .available = false },
+                    },
+                },
+            },
+        }},
+    };
+
+    @setEvalBranchQuota(10000);
+    const decoder = testWriteThenDecode(std.testing.allocator, air_seat_map);
+    defer std.testing.allocator.free(decoder.bytes);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const decoded_value = try decoder.decode(&arena.allocator);
+
+    std.testing.expectEqualSlices(u8, "1179", decoded_value.responses[0].flightSegmentInfo.flightNumber);
+    std.testing.expectEqualSlices(u8, "LAS", decoded_value.responses[0].flightSegmentInfo.departureAirport);
+    std.testing.expectEqualSlices(u8, "IAH", decoded_value.responses[0].flightSegmentInfo.arrivalAirport);
+
+    std.testing.expectEqual(CabinTypeUnion.First, decoded_value.responses[0].seatMap[0].cabinType);
+    std.testing.expectEqualSlices(u8, "1A", decoded_value.responses[0].seatMap[0].seats[0].seatNumber);
+    std.testing.expectEqual(false, decoded_value.responses[0].seatMap[0].seats[0].available);
+
+    std.testing.expectEqual(CabinTypeUnion{ .Economy = 10 }, decoded_value.responses[0].seatMap[1].cabinType);
+    std.testing.expectEqualSlices(u8, "7C", decoded_value.responses[0].seatMap[1].seats[2].seatNumber);
+    std.testing.expectEqual(true, decoded_value.responses[0].seatMap[1].seats[2].available);
 }
