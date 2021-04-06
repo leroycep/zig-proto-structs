@@ -212,9 +212,9 @@ pub fn Decoder(comptime _T: type) type {
 
         const T = _T;
 
-        pub fn fromBytes(bytes: []const u8) ?@This() {
+        pub fn fromBytes(bytes: []const u8) !@This() {
             if (space_required(T) > bytes.len) {
-                return null;
+                return error.OutOfBounds;
             }
             return @This(){
                 .bytes = bytes,
@@ -760,7 +760,7 @@ test "read data from proto encoding" {
         'w', 'o', 'r', 'l', 'd', // String 2
     };
 
-    const decoder = Decoder([]const []const u8).fromBytes(&bytes).?;
+    const decoder = try Decoder([]const []const u8).fromBytes(&bytes);
 
     std.testing.expectEqualSlices(u8, "hello", decoder.element(0).asSlice());
     std.testing.expectEqualSlices(u8, "world", decoder.element(1).asSlice());
@@ -809,7 +809,7 @@ test "write and read struct data from proto encoding" {
     std.testing.expectEqualSlices(u8, &expected, encoded_bytes);
 
     // Test decoding struct
-    const decoder = Decoder(S).fromBytes(encoded_bytes).?;
+    const decoder = try Decoder(S).fromBytes(encoded_bytes);
 
     std.testing.expectEqual(@as(u64, 1337), decoder.field("start").toValue());
     std.testing.expectEqualSlices(u8, input_data.tags[0], decoder.field("tags").element(0).asSlice());
@@ -819,7 +819,7 @@ test "write and read struct data from proto encoding" {
 
 fn testWriteThenDecode(allocator: *std.mem.Allocator, value: anytype) Decoder(@TypeOf(value)) {
     const encoded_bytes = encode(allocator, value) catch unreachable;
-    return Decoder(@TypeOf(value)).fromBytes(encoded_bytes).?;
+    return Decoder(@TypeOf(value)).fromBytes(encoded_bytes) catch unreachable;
 }
 
 test "write and read optional" {
