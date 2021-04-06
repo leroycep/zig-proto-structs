@@ -1,26 +1,43 @@
 const std = @import("std");
 
+pub fn encode(allocator: *std.mem.Allocator, value: anytype) ![]u8 {
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    return try encoder.encodeOwned(value);
+}
+
 pub const Encoder = struct {
-    allocator: *std.mem.Allocator = undefined,
     bytes: std.ArrayList(u8) = undefined,
     pointers_encoded: std.AutoHashMap(usize, u32) = undefined,
 
     pub const Error = error{} || std.mem.Allocator.Error;
 
-    pub fn encode(this: *@This(), allocator: *std.mem.Allocator, value: anytype) ![]u8 {
-        this.allocator = allocator;
-        this.bytes = std.ArrayList(u8).init(allocator);
-        this.pointers_encoded = std.AutoHashMap(usize, u32).init(allocator);
-        defer {
-            this.allocator = undefined;
-            this.bytes = undefined;
-            this.pointers_encoded.deinit();
-            this.pointers_encoded = undefined;
-        }
+    pub fn init(allocator: *std.mem.Allocator) @This() {
+        return @This(){
+            .bytes = std.ArrayList(u8).init(allocator),
+            .pointers_encoded = std.AutoHashMap(usize, u32).init(allocator),
+        };
+    }
+
+    pub fn deinit(this: *@This()) void {
+        this.bytes.deinit();
+        this.pointers_encoded.deinit();
+    }
+
+    pub fn encode(this: *@This(), value: anytype) ![]u8 {
+        this.bytes.shrinkRetainingCapacity(0);
+        this.pointers_encoded.clearRetainingCapacity();
 
         const root_byte_len = space_required(@TypeOf(value));
         const root_space = try this.reserve_space(root_byte_len);
         try this.encode_value(value, root_space);
+
+        return this.bytes.items;
+    }
+
+    pub fn encodeOwned(this: *@This(), value: anytype) ![]u8 {
+        _ = try this.encode(value);
+        defer this.pointers_encoded.clearRetainingCapacity();
 
         return this.bytes.toOwnedSlice();
     }
@@ -582,8 +599,7 @@ test "convert data from memory to proto encoding" {
         'w', 'o', 'r', 'l', 'd', // String 2
     };
 
-    var encoder = Encoder{};
-    const tags_proto = try encoder.encode(std.testing.allocator, @as([]const []const u8, &tags));
+    const tags_proto = try encode(std.testing.allocator, @as([]const []const u8, &tags));
     defer std.testing.allocator.free(tags_proto);
 
     std.testing.expectEqualSlices(u8, &expected, tags_proto);
@@ -649,8 +665,7 @@ test "write and read struct data from proto encoding" {
     };
 
     // Test encoding struct
-    var encoder = Encoder{};
-    const encoded_bytes = try encoder.encode(std.testing.allocator, input_data);
+    const encoded_bytes = try encode(std.testing.allocator, input_data);
     defer std.testing.allocator.free(encoded_bytes);
 
     std.testing.expectEqualSlices(u8, &expected, encoded_bytes);
@@ -665,8 +680,7 @@ test "write and read struct data from proto encoding" {
 }
 
 fn testWriteThenDecode(allocator: *std.mem.Allocator, value: anytype) Decoder(@TypeOf(value)) {
-    var encoder = Encoder{};
-    const encoded_bytes = encoder.encode(allocator, value) catch unreachable;
+    const encoded_bytes = encode(allocator, value) catch unreachable;
     return Decoder(@TypeOf(value)).fromBytes(encoded_bytes).?;
 }
 
