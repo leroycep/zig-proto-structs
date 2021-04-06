@@ -262,10 +262,12 @@ pub fn Decoder(comptime _T: type) type {
                     var struct_value: T = undefined;
                     comptime var offset: u32 = 0;
                     inline for (info.fields) |child_field| {
-                        @field(struct_value, child_field.name) = try (Decoder(child_field.field_type){
+                        const decoder = Decoder(child_field.field_type){
                             .bytes = this.bytes,
                             .ptr = this.ptr + offset,
-                        }).decode(allocator);
+                        };
+                        const field_value = try decoder.decode(allocator);
+                        @field(struct_value, child_field.name) = field_value;
 
                         offset += comptime space_required(child_field.field_type);
                     }
