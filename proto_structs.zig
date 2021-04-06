@@ -222,9 +222,14 @@ pub fn Decoder(comptime _T: type) type {
             };
         }
 
+        const DecodeError = error{
+            OutOfBounds,
+            OutOfMemory,
+        } || std.meta.IntToEnumError;
+
         /// Recursively decodes the struct, allocating any space needed for slices. This space must
         /// be freed by the caller. Using an ArenaAllocator is recommended.
-        pub fn decode(this: @This(), allocator: *std.mem.Allocator) !T {
+        pub fn decode(this: @This(), allocator: *std.mem.Allocator) DecodeError!T {
             switch (@typeInfo(T)) {
                 .Void => return {},
                 .Bool => {
@@ -260,17 +265,30 @@ pub fn Decoder(comptime _T: type) type {
                 },
                 .Struct => |info| {
                     var struct_value: T = undefined;
+                    var err: ?DecodeError = null;
                     comptime var offset: u32 = 0;
-                    inline for (info.fields) |child_field| {
+                    comptime var child_field_idx = 0;
+                    inline while (child_field_idx < info.fields.len) : (child_field_idx += 1) {
+                        comptime const child_field = info.fields[child_field_idx];
+
                         const decoder = Decoder(child_field.field_type){
                             .bytes = this.bytes,
                             .ptr = this.ptr + offset,
                         };
-                        const field_value = try decoder.decode(allocator);
+                        const field_value = decoder.decode(allocator) catch |e| {
+                            err = e;
+                            break;
+                        };
                         @field(struct_value, child_field.name) = field_value;
 
                         offset += comptime space_required(child_field.field_type);
                     }
+
+                    // TODO: Remove this ugly hack when this is resolved: https://github.com/ziglang/zig/issues/6726
+                    if (err) |e| {
+                        return e;
+                    }
+
                     return struct_value;
                 },
                 .Enum => |info| {
@@ -284,7 +302,7 @@ pub fn Decoder(comptime _T: type) type {
                     const size = space_required(TagType);
                     const child_ptr = this.ptr + size;
 
-                    const tag = try (Decoder(TagType){ .bytes = this.bytes, .ptr = this.ptr }).tryToValue();
+                    const tag = try (Decoder(TagType){ .bytes = this.bytes, .ptr = this.ptr }).decode(allocator);
 
                     inline for (@typeInfo(T).Union.fields) |union_field, idx| {
                         if (tag == comptime std.meta.stringToEnum(TagType, union_field.name).?) {
@@ -295,7 +313,7 @@ pub fn Decoder(comptime _T: type) type {
                         }
                     }
 
-                    return error.InvalidEnumValue;
+                    return error.InvalidEnumTag;
                 },
                 .Pointer => |info| switch (info.size) {
                     // TODO: If a pointer has be deserialized, don't duplicate it
@@ -303,7 +321,6 @@ pub fn Decoder(comptime _T: type) type {
                         const ptr = std.mem.readIntLittle(u32, this.bytes[this.ptr..][0..4]);
                         const child_size = space_required(child_type());
                         if (ptr + child_size > this.bytes.len) {
-                            // TODO: Consider returning an error instead?
                             return error.OutOfBounds;
                         }
 
@@ -576,7 +593,7 @@ pub fn Decoder(comptime _T: type) type {
                 }
             }
 
-            return error.InvalidEnumValue;
+            return error.InvalidEnumTag;
         }
 
         pub fn access_type(comptime access_string: []const u8) type {
