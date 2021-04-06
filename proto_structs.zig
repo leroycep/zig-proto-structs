@@ -348,6 +348,28 @@ pub fn Decoder(comptime _T: type) type {
             }
         }
 
+        fn optional_child_type() type {
+            switch (@typeInfo(T)) {
+                .Optional => |info| return info.child,
+                else => |t| @compileError(std.meta.tagName(t) ++ " has no child type"),
+            }
+        }
+
+        pub fn optional(this: @This()) ?Decoder(optional_child_type()) {
+            const ti = @typeInfo(T);
+            if (ti != .Optional) @compileError("Cannot access type " ++ @typeName(T) ++ " as an optional");
+            const info = ti.Optional;
+
+            if (this.bytes[this.ptr] == 1) {
+                return Decoder(optional_child_type()){
+                    .bytes = this.bytes,
+                    .ptr = this.ptr + 1,
+                };
+            } else {
+                return null;
+            }
+        }
+
         pub fn toValue(this: @This()) T {
             switch (@typeInfo(T)) {
                 .Bool => {
@@ -689,16 +711,19 @@ test "write and read optional" {
         const decoder = testWriteThenDecode(std.testing.allocator, @as(?u64, null));
         defer std.testing.allocator.free(decoder.bytes);
         std.testing.expectEqual(@as(?u64, null), decoder.toValue());
+        std.testing.expectEqual(@as(?Decoder(u64), null), decoder.optional());
     }
     {
         const decoder = testWriteThenDecode(std.testing.allocator, @as(?u64, 1337));
         defer std.testing.allocator.free(decoder.bytes);
         std.testing.expectEqual(@as(?u64, 1337), decoder.toValue());
+        std.debug.assert(decoder.optional() != null);
     }
     {
         const decoder = testWriteThenDecode(std.testing.allocator, @as(?u8, 42));
         defer std.testing.allocator.free(decoder.bytes);
         std.testing.expectEqual(@as(?u8, 42), decoder.toValue());
+        std.debug.assert(decoder.optional() != null);
     }
 }
 
