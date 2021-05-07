@@ -70,6 +70,12 @@ pub const Encoder = struct {
                 var slice = this.space_to_slice(space);
                 std.mem.writeIntLittle(T, slice[0..@sizeOf(T)], value);
             },
+            .Float => |info| {
+                var slice = this.space_to_slice(space);
+                const size = @sizeOf(T);
+                const I = @Type(.{ .Int = .{ .bits = info.bits, .signedness = .unsigned } });
+                std.mem.writeIntLittle(I, slice[0..size], @bitCast(I, value));
+            },
             .Pointer => |info| switch (info.size) {
                 .One => {
                     const gop = try this.pointers_encoded.getOrPut(@ptrToInt(value));
@@ -164,6 +170,12 @@ fn space_required(comptime T: type) u32 {
             }
             return @sizeOf(T);
         },
+        .Float => |info| {
+            if (info.bits % 8 != 0) {
+                @compileError("Cannot use float " ++ @typeName(T) ++ "; float bits must be a multiple of 8");
+            }
+            return @sizeOf(T);
+        },
         .Pointer => |info| switch (info.size) {
             .One => return 4, // offset
             .Slice => return 4 + 4, // offset + len
@@ -238,6 +250,12 @@ pub fn Decoder(comptime _T: type) type {
                 .Int => {
                     const size = @sizeOf(T);
                     return std.mem.readIntLittle(T, this.bytes[this.ptr..][0..size]);
+                },
+                .Float => |float_info| {
+                    const size = @sizeOf(T);
+                    const I = @Type(.{ .Int = .{ .bits = float_info.bits, .signedness = .unsigned } });
+                    const bits = std.mem.readIntLittle(I, this.bytes[this.ptr..][0..size]);
+                    return @bitCast(T, bits);
                 },
                 .Optional => |info| {
                     if (this.bytes[this.ptr] == 1) {
