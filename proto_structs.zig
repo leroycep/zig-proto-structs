@@ -66,7 +66,7 @@ pub const Encoder = struct {
                 var slice = this.space_to_slice(space);
                 slice[0] = @boolToInt(value);
             },
-            .Int => |info| {
+            .Int => {
                 var slice = this.space_to_slice(space);
                 std.mem.writeIntLittle(T, slice[0..@sizeOf(T)], value);
             },
@@ -85,12 +85,12 @@ pub const Encoder = struct {
                     if (!gop.found_existing) {
                         const child_space = try this.reserve_space(child_size);
 
-                        gop.entry.value = child_space.ptr;
+                        gop.value_ptr.* = child_space.ptr;
 
                         try this.encode_value(value.*, child_space);
                     }
                     var slice = this.space_to_slice(space);
-                    std.mem.writeIntLittle(u32, slice[0..4], gop.entry.value);
+                    std.mem.writeIntLittle(u32, slice[0..4], gop.value_ptr.*);
                 },
                 .Slice => {
                     const child_size = space_required(info.child);
@@ -125,7 +125,7 @@ pub const Encoder = struct {
                     offset += field_len;
                 }
             },
-            .Optional => |info| {
+            .Optional => {
                 var slice = this.space_to_slice(space);
                 if (value) |not_null| {
                     slice[0] = 1;
@@ -144,7 +144,7 @@ pub const Encoder = struct {
                     try this.encode_value(child, child_space);
                 }
             },
-            .Enum => |info| try this.encode_value(@enumToInt(value), space),
+            .Enum => try this.encode_value(@enumToInt(value), space),
             .Union => |info| {
                 const tag = @as(info.tag_type.?, value);
                 const tag_space = space_required(@TypeOf(tag));
@@ -287,7 +287,7 @@ pub fn Decoder(comptime _T: type) type {
                     comptime var offset: u32 = 0;
                     comptime var child_field_idx = 0;
                     inline while (child_field_idx < info.fields.len) : (child_field_idx += 1) {
-                        comptime const child_field = info.fields[child_field_idx];
+                        const child_field = info.fields[child_field_idx];
 
                         const decoder = Decoder(child_field.field_type){
                             .bytes = this.bytes,
@@ -322,9 +322,9 @@ pub fn Decoder(comptime _T: type) type {
 
                     const tag = try (Decoder(TagType){ .bytes = this.bytes, .ptr = this.ptr }).decode(allocator);
 
-                    inline for (@typeInfo(T).Union.fields) |union_field, idx| {
+                    inline for (@typeInfo(T).Union.fields) |union_field| {
                         if (tag == comptime std.meta.stringToEnum(TagType, union_field.name).?) {
-                            return @unionInit(decoder_union(T), union_field.name, try (Decoder(union_field.field_type){
+                            return @unionInit(decoder_union(), union_field.name, try (Decoder(union_field.field_type){
                                 .bytes = this.bytes,
                                 .ptr = child_ptr,
                             }).decode(allocator));
@@ -498,7 +498,7 @@ pub fn Decoder(comptime _T: type) type {
                     }
                     @compileError("Unknown field " ++ field_name ++ " in struct " ++ @typeName(T));
                 },
-                else => |t| @compileError("Cannot access type " ++ @typeName(T) ++ " as a struct"),
+                else => @compileError("Cannot access type " ++ @typeName(T) ++ " as a struct"),
             }
         }
 
@@ -512,7 +512,6 @@ pub fn Decoder(comptime _T: type) type {
         pub fn optional(this: @This()) ?Decoder(optional_child_type()) {
             const ti = @typeInfo(T);
             if (ti != .Optional) @compileError("Cannot access type " ++ @typeName(T) ++ " as an optional");
-            const info = ti.Optional;
 
             if (this.bytes[this.ptr] == 1) {
                 return Decoder(optional_child_type()){
@@ -574,7 +573,7 @@ pub fn Decoder(comptime _T: type) type {
             }
         }
 
-        fn decoder_union(comptime union_type: type) type {
+        fn decoder_union() type {
             const ti = @typeInfo(T).Union;
 
             comptime var decoder_union_fields: [ti.fields.len]std.builtin.TypeInfo.UnionField = undefined;
@@ -593,7 +592,7 @@ pub fn Decoder(comptime _T: type) type {
             return @Type(decoder_union_ti);
         }
 
-        pub fn toUnion(this: @This()) !decoder_union(T) {
+        pub fn toUnion(this: @This()) !decoder_union() {
             if (@typeInfo(T) != .Union) @compileError(@typeName(T) ++ " is not a union");
 
             const TagType = @typeInfo(T).Union.tag_type.?;
@@ -602,9 +601,9 @@ pub fn Decoder(comptime _T: type) type {
 
             const tag = try (Decoder(TagType){ .bytes = this.bytes, .ptr = this.ptr }).tryToValue();
 
-            inline for (@typeInfo(T).Union.fields) |union_field, idx| {
+            inline for (@typeInfo(T).Union.fields) |union_field| {
                 if (tag == comptime std.meta.stringToEnum(TagType, union_field.name).?) {
-                    return @unionInit(decoder_union(T), union_field.name, Decoder(union_field.field_type){
+                    return @unionInit(decoder_union(), union_field.name, Decoder(union_field.field_type){
                         .bytes = this.bytes,
                         .ptr = child_ptr,
                     });
@@ -777,7 +776,7 @@ test "convert data from memory to proto encoding" {
     const tags_proto = try encode(std.testing.allocator, @as([]const []const u8, &tags));
     defer std.testing.allocator.free(tags_proto);
 
-    std.testing.expectEqualSlices(u8, &expected, tags_proto);
+    try std.testing.expectEqualSlices(u8, &expected, tags_proto);
 }
 
 test "read data from proto encoding" {
@@ -799,8 +798,8 @@ test "read data from proto encoding" {
 
     const decoder = try Decoder([]const []const u8).fromBytes(&bytes);
 
-    std.testing.expectEqualSlices(u8, "hello", decoder.element(0).asSlice());
-    std.testing.expectEqualSlices(u8, "world", decoder.element(1).asSlice());
+    try std.testing.expectEqualSlices(u8, "hello", decoder.element(0).asSlice());
+    try std.testing.expectEqualSlices(u8, "world", decoder.element(1).asSlice());
 }
 
 test "write and read struct data from proto encoding" {
@@ -843,15 +842,15 @@ test "write and read struct data from proto encoding" {
     const encoded_bytes = try encode(std.testing.allocator, input_data);
     defer std.testing.allocator.free(encoded_bytes);
 
-    std.testing.expectEqualSlices(u8, &expected, encoded_bytes);
+    try std.testing.expectEqualSlices(u8, &expected, encoded_bytes);
 
     // Test decoding struct
     const decoder = try Decoder(S).fromBytes(encoded_bytes);
 
-    std.testing.expectEqual(@as(u64, 1337), decoder.field("start").toValue());
-    std.testing.expectEqualSlices(u8, input_data.tags[0], decoder.field("tags").element(0).asSlice());
-    std.testing.expectEqualSlices(u8, input_data.tags[1], decoder.field("tags").element(1).asSlice());
-    std.testing.expectEqualSlices(u8, input_data.tags[2], decoder.field("tags").element(2).asSlice());
+    try std.testing.expectEqual(@as(u64, 1337), decoder.field("start").toValue());
+    try std.testing.expectEqualSlices(u8, input_data.tags[0], decoder.field("tags").element(0).asSlice());
+    try std.testing.expectEqualSlices(u8, input_data.tags[1], decoder.field("tags").element(1).asSlice());
+    try std.testing.expectEqualSlices(u8, input_data.tags[2], decoder.field("tags").element(2).asSlice());
 }
 
 fn testWriteThenDecode(allocator: *std.mem.Allocator, value: anytype) Decoder(@TypeOf(value)) {
@@ -863,19 +862,19 @@ test "write and read optional" {
     {
         const decoder = testWriteThenDecode(std.testing.allocator, @as(?u64, null));
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(@as(?u64, null), decoder.toValue());
-        std.testing.expectEqual(@as(?Decoder(u64), null), decoder.optional());
+        try std.testing.expectEqual(@as(?u64, null), decoder.toValue());
+        try std.testing.expectEqual(@as(?Decoder(u64), null), decoder.optional());
     }
     {
         const decoder = testWriteThenDecode(std.testing.allocator, @as(?u64, 1337));
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(@as(?u64, 1337), decoder.toValue());
+        try std.testing.expectEqual(@as(?u64, 1337), decoder.toValue());
         std.debug.assert(decoder.optional() != null);
     }
     {
         const decoder = testWriteThenDecode(std.testing.allocator, @as(?u8, 42));
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(@as(?u8, 42), decoder.toValue());
+        try std.testing.expectEqual(@as(?u8, 42), decoder.toValue());
         std.debug.assert(decoder.optional() != null);
     }
 }
@@ -884,12 +883,12 @@ test "write and read array" {
     {
         const decoder = testWriteThenDecode(std.testing.allocator, @as([3]u8, "foo".*));
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(@as([3]u8, "foo".*), decoder.toValue());
+        try std.testing.expectEqual(@as([3]u8, "foo".*), decoder.toValue());
     }
     {
         const decoder = testWriteThenDecode(std.testing.allocator, @as([0]u8, .{}));
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(@as([0]u8, .{}), decoder.toValue());
+        try std.testing.expectEqual(@as([0]u8, .{}), decoder.toValue());
     }
 }
 
@@ -901,12 +900,12 @@ test "write and read enum" {
     {
         const decoder = testWriteThenDecode(std.testing.allocator, E.foo);
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(E.foo, try decoder.tryToValue());
+        try std.testing.expectEqual(E.foo, try decoder.tryToValue());
     }
     {
         const decoder = testWriteThenDecode(std.testing.allocator, E.bar);
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(E.bar, try decoder.tryToValue());
+        try std.testing.expectEqual(E.bar, try decoder.tryToValue());
     }
 }
 
@@ -924,7 +923,7 @@ test "write and read union" {
         defer std.testing.allocator.free(decoder.bytes);
         switch (try decoder.toUnion()) {
             .integer => |int_decoder| {
-                std.testing.expectEqual(@as(u32, 42), int_decoder.toValue());
+                try std.testing.expectEqual(@as(u32, 42), int_decoder.toValue());
             },
             else => unreachable,
         }
@@ -934,7 +933,7 @@ test "write and read union" {
         defer std.testing.allocator.free(decoder.bytes);
         switch (try decoder.toUnion()) {
             .text => |text_decoder| {
-                std.testing.expectEqualSlices(u8, "hello", text_decoder.asSlice());
+                try std.testing.expectEqualSlices(u8, "hello", text_decoder.asSlice());
             },
             else => unreachable,
         }
@@ -951,7 +950,7 @@ test "write and read graphs" {
         const graph = N{ .edges = &.{} };
         const decoder = testWriteThenDecode(std.testing.allocator, graph);
         defer std.testing.allocator.free(decoder.bytes);
-        std.testing.expectEqual(@as(u32, 0), decoder.field("edges").len());
+        try std.testing.expectEqual(@as(u32, 0), decoder.field("edges").len());
     }
     {
         // Tree
@@ -965,14 +964,14 @@ test "write and read graphs" {
         defer std.testing.allocator.free(decoder.bytes);
 
         const root_edges = decoder.field("edges");
-        std.testing.expectEqual(@as(u32, 2), root_edges.len());
+        try std.testing.expectEqual(@as(u32, 2), root_edges.len());
 
-        std.testing.expectEqual(@as(u32, 2), root_edges.element(0).deref().field("edges").len());
-        std.testing.expectEqual(@as(u32, 0), root_edges.element(1).deref().field("edges").len());
+        try std.testing.expectEqual(@as(u32, 2), root_edges.element(0).deref().field("edges").len());
+        try std.testing.expectEqual(@as(u32, 0), root_edges.element(1).deref().field("edges").len());
 
         const elem0_edges = root_edges.element(0).deref().field("edges");
-        std.testing.expectEqual(@as(u32, 0), elem0_edges.element(0).deref().field("edges").len());
-        std.testing.expectEqual(@as(u32, 0), elem0_edges.element(1).deref().field("edges").len());
+        try std.testing.expectEqual(@as(u32, 0), elem0_edges.element(0).deref().field("edges").len());
+        try std.testing.expectEqual(@as(u32, 0), elem0_edges.element(1).deref().field("edges").len());
     }
     {
         const LN = struct { next: *const @This() };
@@ -1060,17 +1059,17 @@ test "access function for accessing deeply nested data" {
     const decoder = testWriteThenDecode(std.testing.allocator, air_seat_map);
     defer std.testing.allocator.free(decoder.bytes);
 
-    std.testing.expectEqualSlices(u8, "1179", decoder.access(".responses[0].flightSegmentInfo.flightNumber").asSlice());
-    std.testing.expectEqualSlices(u8, "LAS", decoder.access(".responses[0].flightSegmentInfo.departureAirport").asSlice());
-    std.testing.expectEqualSlices(u8, "IAH", decoder.access(".responses[0].flightSegmentInfo.arrivalAirport").asSlice());
+    try std.testing.expectEqualSlices(u8, "1179", decoder.access(".responses[0].flightSegmentInfo.flightNumber").asSlice());
+    try std.testing.expectEqualSlices(u8, "LAS", decoder.access(".responses[0].flightSegmentInfo.departureAirport").asSlice());
+    try std.testing.expectEqualSlices(u8, "IAH", decoder.access(".responses[0].flightSegmentInfo.arrivalAirport").asSlice());
 
-    std.testing.expectEqual(CabinType.First, try decoder.access(".responses[0].seatMap[0].cabinType").tryToValue());
-    std.testing.expectEqualSlices(u8, "1A", decoder.access(".responses[0].seatMap[0].seats[0].seatNumber").asSlice());
-    std.testing.expectEqual(false, try decoder.access(".responses[0].seatMap[0].seats[0].available").tryToValue());
+    try std.testing.expectEqual(CabinType.First, try decoder.access(".responses[0].seatMap[0].cabinType").tryToValue());
+    try std.testing.expectEqualSlices(u8, "1A", decoder.access(".responses[0].seatMap[0].seats[0].seatNumber").asSlice());
+    try std.testing.expectEqual(false, try decoder.access(".responses[0].seatMap[0].seats[0].available").tryToValue());
 
-    std.testing.expectEqual(CabinType.Economy, try decoder.access(".responses[0].seatMap[1].cabinType").tryToValue());
-    std.testing.expectEqualSlices(u8, "7C", decoder.access(".responses[0].seatMap[1].seats[2].seatNumber").asSlice());
-    std.testing.expectEqual(true, try decoder.access(".responses[0].seatMap[1].seats[2].available").tryToValue());
+    try std.testing.expectEqual(CabinType.Economy, try decoder.access(".responses[0].seatMap[1].cabinType").tryToValue());
+    try std.testing.expectEqualSlices(u8, "7C", decoder.access(".responses[0].seatMap[1].seats[2].seatNumber").asSlice());
+    try std.testing.expectEqual(true, try decoder.access(".responses[0].seatMap[1].seats[2].available").tryToValue());
 }
 
 test "decode deeply nested data" {
@@ -1144,15 +1143,15 @@ test "decode deeply nested data" {
 
     const decoded_value = try decoder.decode(&arena.allocator);
 
-    std.testing.expectEqualSlices(u8, "1179", decoded_value.responses[0].flightSegmentInfo.flightNumber);
-    std.testing.expectEqualSlices(u8, "LAS", decoded_value.responses[0].flightSegmentInfo.departureAirport);
-    std.testing.expectEqualSlices(u8, "IAH", decoded_value.responses[0].flightSegmentInfo.arrivalAirport);
+    try std.testing.expectEqualSlices(u8, "1179", decoded_value.responses[0].flightSegmentInfo.flightNumber);
+    try std.testing.expectEqualSlices(u8, "LAS", decoded_value.responses[0].flightSegmentInfo.departureAirport);
+    try std.testing.expectEqualSlices(u8, "IAH", decoded_value.responses[0].flightSegmentInfo.arrivalAirport);
 
-    std.testing.expectEqual(CabinTypeUnion.First, decoded_value.responses[0].seatMap[0].cabinType);
-    std.testing.expectEqualSlices(u8, "1A", decoded_value.responses[0].seatMap[0].seats[0].seatNumber);
-    std.testing.expectEqual(false, decoded_value.responses[0].seatMap[0].seats[0].available);
+    try std.testing.expectEqual(CabinTypeUnion.First, decoded_value.responses[0].seatMap[0].cabinType);
+    try std.testing.expectEqualSlices(u8, "1A", decoded_value.responses[0].seatMap[0].seats[0].seatNumber);
+    try std.testing.expectEqual(false, decoded_value.responses[0].seatMap[0].seats[0].available);
 
-    std.testing.expectEqual(CabinTypeUnion{ .Economy = 10 }, decoded_value.responses[0].seatMap[1].cabinType);
-    std.testing.expectEqualSlices(u8, "7C", decoded_value.responses[0].seatMap[1].seats[2].seatNumber);
-    std.testing.expectEqual(true, decoded_value.responses[0].seatMap[1].seats[2].available);
+    try std.testing.expectEqual(CabinTypeUnion{ .Economy = 10 }, decoded_value.responses[0].seatMap[1].cabinType);
+    try std.testing.expectEqualSlices(u8, "7C", decoded_value.responses[0].seatMap[1].seats[2].seatNumber);
+    try std.testing.expectEqual(true, decoded_value.responses[0].seatMap[1].seats[2].available);
 }
