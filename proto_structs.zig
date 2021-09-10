@@ -746,8 +746,6 @@ pub fn Decoder(comptime _T: type) type {
                     },
                 }
             }
-
-            return current_type;
         }
     };
 }
