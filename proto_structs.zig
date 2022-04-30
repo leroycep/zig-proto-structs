@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn encode(allocator: *std.mem.Allocator, value: anytype) ![]u8 {
+pub fn encode(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     var encoder = Encoder.init(allocator);
     defer encoder.deinit();
     return try encoder.encodeOwned(value);
@@ -12,7 +12,7 @@ pub const Encoder = struct {
 
     pub const Error = error{} || std.mem.Allocator.Error;
 
-    pub fn init(allocator: *std.mem.Allocator) @This() {
+    pub fn init(allocator: std.mem.Allocator) @This() {
         return @This(){
             .bytes = std.ArrayList(u8).init(allocator),
             .pointers_encoded = std.AutoHashMap(usize, u32).init(allocator),
@@ -241,7 +241,7 @@ pub fn Decoder(comptime _T: type) type {
 
         /// Recursively decodes the struct, allocating any space needed for slices. This space must
         /// be freed by the caller. Using an ArenaAllocator is recommended.
-        pub fn decode(this: @This(), allocator: *std.mem.Allocator) DecodeError!T {
+        pub fn decode(this: @This(), allocator: std.mem.Allocator) DecodeError!T {
             switch (@typeInfo(T)) {
                 .Void => return {},
                 .Bool => {
@@ -851,7 +851,7 @@ test "write and read struct data from proto encoding" {
     try std.testing.expectEqualSlices(u8, input_data.tags[2], decoder.field("tags").element(2).asSlice());
 }
 
-fn testWriteThenDecode(allocator: *std.mem.Allocator, value: anytype) Decoder(@TypeOf(value)) {
+fn testWriteThenDecode(allocator: std.mem.Allocator, value: anytype) Decoder(@TypeOf(value)) {
     const encoded_bytes = encode(allocator, value) catch unreachable;
     return Decoder(@TypeOf(value)).fromBytes(encoded_bytes) catch unreachable;
 }
@@ -1139,7 +1139,7 @@ test "decode deeply nested data" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const decoded_value = try decoder.decode(&arena.allocator);
+    const decoded_value = try decoder.decode(arena.allocator());
 
     try std.testing.expectEqualSlices(u8, "1179", decoded_value.responses[0].flightSegmentInfo.flightNumber);
     try std.testing.expectEqualSlices(u8, "LAS", decoded_value.responses[0].flightSegmentInfo.departureAirport);
